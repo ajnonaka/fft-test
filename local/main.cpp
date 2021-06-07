@@ -4,41 +4,16 @@
 #include <AMReX_ParmParse.H>
 #include <AMReX_GpuComplex.H>
 
-#ifdef AMREX_USE_CUDA
-#include <cufft.h>
-#else
 #include <fftw3.h>
 #include <fftw3-mpi.h>
-#endif
 
 using namespace amrex;
-
-#ifdef AMREX_USE_CUDA
-std::string cufftErrorToString (const cufftResult& err)
-{
-    switch (err) {
-    case CUFFT_SUCCESS:  return "CUFFT_SUCCESS";
-    case CUFFT_INVALID_PLAN: return "CUFFT_INVALID_PLAN";
-    case CUFFT_ALLOC_FAILED: return "CUFFT_ALLOC_FAILED";
-    case CUFFT_INVALID_TYPE: return "CUFFT_INVALID_TYPE";
-    case CUFFT_INVALID_VALUE: return "CUFFT_INVALID_VALUE";
-    case CUFFT_INTERNAL_ERROR: return "CUFFT_INTERNAL_ERROR";
-    case CUFFT_EXEC_FAILED: return "CUFFT_EXEC_FAILED";
-    case CUFFT_SETUP_FAILED: return "CUFFT_SETUP_FAILED";
-    case CUFFT_INVALID_SIZE: return "CUFFT_INVALID_SIZE";
-    case CUFFT_UNALIGNED_DATA: return "CUFFT_UNALIGNED_DATA";
-    default: return std::to_string(err) + " (unknown error code)";
-    }
-}
-#endif
 
 int main (int argc, char* argv[])
 {
     amrex::Initialize(argc, argv); {
 
-#ifdef USE_FFTW
     fftw_mpi_init();
-#endif
 
     BL_PROFILE("main");
 
@@ -59,13 +34,15 @@ int main (int argc, char* argv[])
         Array<int,3> is_periodic{1,1,1};
         geom.define(domain, rb, CoordSys::cartesian, is_periodic);
 
+        // make the domain one box
         ba.define(domain);
-        ba.maxSize(max_grid_size);
-
         dm.define(ba);
     }
 
-    MultiFab real_field(ba,dm,1,nghost,MFInfo().SetArena(The_Device_Arena()));
+    // the real-space data
+    MultiFab real_field(ba,dm,1,nghost);
+
+    // initialize data to random numbers
     for (MFIter mfi(real_field); mfi.isValid(); ++mfi) {
         Array4<Real> const& fab = real_field.array(mfi);
         amrex::ParallelFor(mfi.fabbox(),
@@ -75,126 +52,97 @@ int main (int argc, char* argv[])
         });
     }
 
-#ifdef AMREX_USE_CUDA
-    using FFTplan = cufftHandle;
-    using FFTcomplex = cuDoubleComplex;
-#else
     using FFTplan = fftw_plan;
     using FFTcomplex = fftw_complex;
-#endif
+
+    // contain to store FFT - note it is shrunk by "half" in x
     Vector<std::unique_ptr<BaseFab<GpuComplex<Real> > > > spectral_field;
+
     Vector<FFTplan> forward_plan;
-    Vector<FFTplan> backward_plan;
+    
     for (MFIter mfi(real_field); mfi.isValid(); ++mfi) {
+        
+        // grab a single box including ghost cell range
         Box realspace_bx = mfi.fabbox();
+
+        // size of box including ghost cell range
         IntVect fft_size = realspace_bx.length(); // This will be different for hybrid FFT
+
+        // this is the size of the box, except the 0th component is 'halved plus 1'
         IntVect spectral_bx_size = fft_size;
         spectral_bx_size[0] = fft_size[0]/2 + 1;
+
+        // spectral box
         Box spectral_bx = Box(IntVect(0), spectral_bx_size - IntVect(1));
+        
         spectral_field.emplace_back(new BaseFab<GpuComplex<Real> >(spectral_bx,1,
                                                                    The_Device_Arena()));
         spectral_field.back()->setVal<RunOn::Device>(0.0); // touch the memory
 
-        FFTplan fplan, bplan;
-#ifdef AMREX_USE_CUDA
-        cufftResult result = cufftPlan3d(&fplan, fft_size[2], fft_size[1], fft_size[0], CUFFT_D2Z);
-        if (result != CUFFT_SUCCESS) {
-            amrex::AllPrint() << " cufftplan3d forward failed! Error: "
-                              << cufftErrorToString(result) << "\n";
-        }
-
-        result = cufftPlan3d(&bplan, fft_size[2], fft_size[1], fft_size[0], CUFFT_Z2D);
-        if (result != CUFFT_SUCCESS) {
-            amrex::AllPrint() << " cufftplan3d backward failed! Error: "
-                              << cufftErrorToString(result) << "\n";
-        }
-#else
+        FFTplan fplan;        
         fplan = fftw_plan_dft_r2c_3d(fft_size[2], fft_size[1], fft_size[0],
                                      real_field[mfi].dataPtr(),
                                      reinterpret_cast<FFTcomplex*>
                                          (spectral_field.back()->dataPtr()),
                                      FFTW_ESTIMATE);
 
-        bplan = fftw_plan_dft_c2r_3d(fft_size[2], fft_size[1], fft_size[0],
-                                     reinterpret_cast<FFTcomplex*>
-                                         (spectral_field.back()->dataPtr()),
-                                     real_field[mfi].dataPtr(),
-                                     FFTW_ESTIMATE);
-#endif
         forward_plan.push_back(fplan);
-        backward_plan.push_back(bplan);
     }
-
-    // warming up
-    real_field.FillBoundary(geom.periodicity());
 
     ParallelDescriptor::Barrier();
 
-    { BL_PROFILE("WarpX-total");
-    {
-        BL_PROFILE("RealDataFillBoundary");
-        real_field.FillBoundary(geom.periodicity());
-    }
-
     // ForwardTransform
-    {
-        BL_PROFILE("ForwardTransform");
-        for (MFIter mfi(real_field); mfi.isValid(); ++mfi)
-        {
-            int i = mfi.LocalIndex();
-#ifdef AMREX_USE_CUDA
-            cufftSetStream(forward_plan[i], amrex::Gpu::gpuStream());
-            cufftResult result = cufftExecD2Z(forward_plan[i],
-                                              real_field[mfi].dataPtr(),
-                                              reinterpret_cast<FFTcomplex*>
-                                                  (spectral_field[i]->dataPtr()));
-            if (result != CUFFT_SUCCESS) {
-                amrex::AllPrint() << " forward transform using cufftExec failed! Error: "
-                                  << cufftErrorToString(result) << "\n";
-            }
-#else
-            fftw_execute(forward_plan[i]);
-#endif
-        }
+    for (MFIter mfi(real_field); mfi.isValid(); ++mfi) {
+        int i = mfi.LocalIndex();
+        fftw_execute(forward_plan[i]);
     }
 
-    // BackwardTransform
-    {
-        BL_PROFILE("BackwardTransform");
-        for (MFIter mfi(real_field); mfi.isValid(); ++mfi)
-        {
-            int i = mfi.LocalIndex();
-#ifdef AMREX_USE_CUDA
-            cufftSetStream(backward_plan[i], amrex::Gpu::gpuStream());
-            cufftResult result = cufftExecZ2D(backward_plan[i],
-                                              reinterpret_cast<FFTcomplex*>
-                                                  (spectral_field[i]->dataPtr()),
-                                              real_field[mfi].dataPtr());
-            if (result != CUFFT_SUCCESS) {
-                amrex::AllPrint() << " backward transform using cufftExec failed! Error: "
-                                  << cufftErrorToString(result) << "\n";
-            }
-#else
-            fftw_execute(backward_plan[i]);
-#endif
-        }
-    }
-    }
+    // storage for the answer (on one grid)
+    MultiFab variables_dft_real(ba,dm,1,nghost);
+    MultiFab variables_dft_imag(ba,dm,1,nghost);
+    
+    // copy data to a full-sized MultiFab
+    for (MFIter mfi(variables_dft_real); mfi.isValid(); ++mfi) {
 
-    // destroy fft plans
+        Array4< GpuComplex<Real> > spectral = (*spectral_field[0]).array();
+
+        Array4<Real> const& realpart = variables_dft_real.array(mfi);
+        Array4<Real> const& imagpart = variables_dft_imag.array(mfi);
+        
+        Box bx = mfi.fabbox();
+        
+        amrex::ParallelFor(bx,
+        [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            if (i <= bx.length(0)/2) {
+                // copy value
+                realpart(i,j,k) = spectral(i,j,k).real();
+                imagpart(i,j,k) = spectral(i,j,k).imag();
+            } else {
+                // copy complex conjugate
+                int iloc = bx.length(0)-i;
+                int jloc = (j == 0) ? 0 : bx.length(1)-j;
+                int kloc = (k == 0) ? 0 : bx.length(2)-k;
+
+                realpart(i,j,k) =  spectral(iloc,jloc,kloc).real();
+                imagpart(i,j,k) = -spectral(iloc,jloc,kloc).imag();
+            }                
+        });     
+        
+        amrex::ParallelFor(bx,
+        [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            std::cout << "HACKFFT " << i << " " << j << " " << k << " "
+                      << realpart(i,j,k) << " + " << imagpart(i,j,k,0) << "i" << std::endl;
+        });
+    }
+    
+    // destroy fft plan
     for (int i = 0; i < forward_plan.size(); ++i) {
-#ifdef AMREX_USE_CUDA
-        cufftDestroy(forward_plan[i]);
-        cufftDestroy(backward_plan[i]);
-#else
         fftw_destroy_plan(forward_plan[i]);
-        fftw_destroy_plan(backward_plan[i]);
-#endif
     }
 
-#ifdef USE_FFTW
     fftw_mpi_cleanup();
-#endif
 
     } amrex::Finalize();
 }
