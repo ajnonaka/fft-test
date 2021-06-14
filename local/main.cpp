@@ -24,10 +24,7 @@ int main (int argc, char* argv[])
     {
         ParmParse pp;
         IntVect n_cell;
-        IntVect max_grid_size;
         pp.get("n_cell", n_cell);
-        pp.get("max_grid_size", max_grid_size);
-        pp.get("nghost", nghost);
 
         Box domain(IntVect(0),n_cell-IntVect(1));
         RealBox rb({0.,0.,0.},{1.,1.,1.});
@@ -39,8 +36,8 @@ int main (int argc, char* argv[])
         dm.define(ba);
     }
 
-    // the real-space data
-    MultiFab real_field(ba,dm,1,nghost);
+    // the real-space data (no ghost cells)
+    MultiFab real_field(ba,dm,1,0);
 
     // initialize data to random numbers
     for (MFIter mfi(real_field); mfi.isValid(); ++mfi) {
@@ -102,6 +99,8 @@ int main (int argc, char* argv[])
     MultiFab variables_dft_imag(ba,dm,1,nghost);
     
     // copy data to a full-sized MultiFab
+    // this involves copying the complex conjugate from the half-sized field
+    // into the appropriate place in the full MultiFab
     for (MFIter mfi(variables_dft_real); mfi.isValid(); ++mfi) {
 
         Array4< GpuComplex<Real> > spectral = (*spectral_field[0]).array();
