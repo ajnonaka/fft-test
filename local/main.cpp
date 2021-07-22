@@ -68,10 +68,10 @@ int main (int argc, char* argv[])
     MultiFab real_field(ba,dm,1,nghost,MFInfo().SetArena(The_Device_Arena()));
     for (MFIter mfi(real_field); mfi.isValid(); ++mfi) {
         Array4<Real> const& fab = real_field.array(mfi);
-        amrex::ParallelFor(mfi.fabbox(),
-        [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        amrex::ParallelForRNG(mfi.fabbox(),
+			      [=] AMREX_GPU_DEVICE (int i, int j, int k, amrex::RandomEngine const& engine) noexcept
         {
-            fab(i,j,k) = amrex::Random();
+            fab(i,j,k) = amrex::Random(engine);
         });
     }
 
